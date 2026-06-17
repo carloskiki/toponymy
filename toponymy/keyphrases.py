@@ -1,4 +1,5 @@
 import numpy as np
+import hashlib
 
 from typing import List, Tuple, FrozenSet, Dict, Callable, Any, Optional, Protocol
 from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS
@@ -413,6 +414,23 @@ class KeyphraseBuilder:
     verbose : bool, optional
         Whether to show progress bars and verbose output. If True, shows all output. If False, suppresses all output.
 
+    cache_policy : str, optional
+        Keyphrase cache policy. The default, "none", rebuilds keyphrases on every fit.
+        "auto" reuses cached keyphrase artifacts for small append-only updates that
+        are well covered by the existing vocabulary.
+
+    max_incremental_fraction : float, optional
+        Maximum appended corpus fraction eligible for automatic cache reuse, by default 0.10.
+
+    max_cumulative_incremental_fraction : float, optional
+        Maximum cumulative growth since the last full rebuild eligible for automatic cache reuse, by default 0.20.
+
+    min_incremental_vocab_coverage : float, optional
+        Minimum fraction of significant appended ngram occurrences that must already be in the cached vocabulary, by default 0.85.
+
+    min_incremental_top_ngram_overlap : float, optional
+        Minimum fraction of top significant appended ngrams that must already be in the cached vocabulary, by default 0.75.
+
     Attributes
     ----------
 
@@ -436,7 +454,15 @@ class KeyphraseBuilder:
         n_jobs: int = -1,
         embedder: Optional[TextEmbedderProtocol] = None,
         verbose: bool = None,
+        cache_policy: str = "none",
+        max_incremental_fraction: float = 0.10,
+        max_cumulative_incremental_fraction: float = 0.20,
+        min_incremental_vocab_coverage: float = 0.85,
+        min_incremental_top_ngram_overlap: float = 0.75,
     ):
+        if cache_policy not in {"none", "auto"}:
+            raise ValueError("cache_policy must be either 'none' or 'auto'")
+
         self.object_to_text = object_to_text
         self.ngram_range = ngram_range
         self.tokenizer = tokenizer
@@ -446,16 +472,157 @@ class KeyphraseBuilder:
         self.stop_words = stop_words
         self.n_jobs = n_jobs
         self.embedder = embedder
+        self.cache_policy = cache_policy
+        self.max_incremental_fraction = max_incremental_fraction
+        self.max_cumulative_incremental_fraction = max_cumulative_incremental_fraction
+        self.min_incremental_vocab_coverage = min_incremental_vocab_coverage
+        self.min_incremental_top_ngram_overlap = min_incremental_top_ngram_overlap
 
         # Handle verbose parameters
         _, self.verbose = handle_verbose_params(verbose=verbose, default_verbose=False)
 
-    def fit(self, objects: List[Any]):
-        if self.object_to_text is None:
-            object_texts = objects
-        else:
-            object_texts = [self.object_to_text(obj) for obj in objects]
+        self._keyphrase_cache_text_hashes: Optional[List[str]] = None
+        self._keyphrase_cache_config_signature: Optional[Tuple[Any, ...]] = None
+        self._keyphrase_cache_keyphrase_map: Optional[Dict[str, int]] = None
+        self._keyphrase_cache_base_size: Optional[int] = None
+        self._keyphrase_cache_incremental_rows: int = 0
+        self._keyphrase_vectors_generated_by: Optional[Tuple[Any, ...]] = None
 
+    def _build_ngrammer(self) -> Ngrammer:
+        if self.tokenizer is None:
+            cv = CountVectorizer(
+                lowercase=True,
+                token_pattern=self.token_pattern,
+                ngram_range=self.ngram_range,
+            )
+            return cv.build_analyzer()
+
+        return create_tokenizers_ngrammer(self.tokenizer, ngram_range=self.ngram_range)
+
+    def _cache_config_signature(self) -> Tuple[Any, ...]:
+        stop_words_signature = tuple(sorted(self.stop_words))
+        tokenizer_signature = None
+        if self.tokenizer is not None:
+            tokenizer_signature = (type(self.tokenizer), id(self.tokenizer))
+
+        object_to_text_signature = None
+        if self.object_to_text is not None:
+            object_to_text_signature = (
+                type(self.object_to_text),
+                id(self.object_to_text),
+            )
+
+        embedder_signature = None
+        if self.embedder is not None:
+            embedder_signature = (type(self.embedder), id(self.embedder))
+
+        return (
+            self.ngram_range,
+            tokenizer_signature,
+            self.token_pattern,
+            self.max_features,
+            self.min_occurrences,
+            stop_words_signature,
+            object_to_text_signature,
+            embedder_signature,
+        )
+
+    @staticmethod
+    def _text_hashes(object_texts: List[Any]) -> List[str]:
+        return [
+            hashlib.blake2b(
+                str(text).encode("utf-8", errors="surrogatepass"), digest_size=16
+            ).hexdigest()
+            for text in object_texts
+        ]
+
+    def _has_compatible_cache(self, config_signature: Tuple[Any, ...]) -> bool:
+        return (
+            self._keyphrase_cache_text_hashes is not None
+            and self._keyphrase_cache_config_signature == config_signature
+            and self._keyphrase_cache_keyphrase_map is not None
+            and hasattr(self, "object_x_keyphrase_matrix_")
+            and hasattr(self, "keyphrase_list_")
+            and hasattr(self, "keyphrase_vectors_")
+        )
+
+    def _set_keyphrase_cache_state(
+        self,
+        text_hashes: List[str],
+        config_signature: Tuple[Any, ...],
+        *,
+        reset_incremental_counters: bool,
+    ) -> None:
+        self._keyphrase_cache_text_hashes = text_hashes
+        self._keyphrase_cache_config_signature = config_signature
+        self._keyphrase_cache_keyphrase_map = {
+            keyphrase: i for i, keyphrase in enumerate(self.keyphrase_list_)
+        }
+        if reset_incremental_counters:
+            self._keyphrase_cache_base_size = len(text_hashes)
+            self._keyphrase_cache_incremental_rows = 0
+
+    def _append_is_cacheable(
+        self,
+        appended_texts: List[str],
+        ngrammer: Ngrammer,
+    ) -> bool:
+        if (
+            self._keyphrase_cache_text_hashes is None
+            or self._keyphrase_cache_keyphrase_map is None
+            or self._keyphrase_cache_base_size is None
+        ):
+            return False
+
+        cached_size = len(self._keyphrase_cache_text_hashes)
+        append_size = len(appended_texts)
+        if append_size == 0:
+            return True
+        if cached_size == 0:
+            return False
+        if append_size / cached_size > self.max_incremental_fraction:
+            return False
+        if (
+            self._keyphrase_cache_incremental_rows + append_size
+        ) / self._keyphrase_cache_base_size > self.max_cumulative_incremental_fraction:
+            return False
+
+        append_counts = count_docs_ngrams(
+            appended_texts,
+            ngrammer,
+            self.stop_words,
+            max_ngrams=self.max_features * 10,
+        )
+        significant_counts = {
+            keyphrase: count
+            for keyphrase, count in append_counts.items()
+            if count >= self.min_occurrences
+        }
+        if len(significant_counts) == 0:
+            return True
+
+        total_occurrences = sum(significant_counts.values())
+        cached_occurrences = sum(
+            count
+            for keyphrase, count in significant_counts.items()
+            if keyphrase in self._keyphrase_cache_keyphrase_map
+        )
+        vocab_coverage = cached_occurrences / total_occurrences
+        if vocab_coverage < self.min_incremental_vocab_coverage:
+            return False
+
+        top_ngram_count = min(len(significant_counts), self.max_features)
+        top_ngrams = [
+            keyphrase
+            for keyphrase, _ in Counter(significant_counts).most_common(top_ngram_count)
+        ]
+        top_ngram_overlap = sum(
+            keyphrase in self._keyphrase_cache_keyphrase_map for keyphrase in top_ngrams
+        ) / top_ngram_count
+
+        return top_ngram_overlap >= self.min_incremental_top_ngram_overlap
+
+    def _fit_full(self, object_texts: List[str]):
         if self.verbose:
             print("Building keyphrase matrix ... ")
 
@@ -481,9 +648,80 @@ class KeyphraseBuilder:
                 self.keyphrase_list_,
                 show_progress_bar=self.verbose,
             )
+            self._keyphrase_vectors_generated_by = (
+                "builder",
+                type(self.embedder),
+                id(self.embedder),
+            )
         else:
             self.keyphrase_vectors_ = None
+            self._keyphrase_vectors_generated_by = None
 
+        return self
+
+    def _fit_incremental(
+        self,
+        appended_texts: List[str],
+        text_hashes: List[str],
+        config_signature: Tuple[Any, ...],
+        ngrammer: Ngrammer,
+    ):
+        if self.verbose:
+            print("Extending cached keyphrase matrix ... ")
+
+        appended_matrix = build_keyphrase_count_matrix(
+            appended_texts,
+            self._keyphrase_cache_keyphrase_map,
+            ngrammer=ngrammer,
+            n_jobs=self.n_jobs,
+            verbose=self.verbose,
+        )
+        self.object_x_keyphrase_matrix_ = scipy.sparse.vstack(
+            [self.object_x_keyphrase_matrix_, appended_matrix]
+        ).tocsr()
+        self._keyphrase_cache_incremental_rows += len(appended_texts)
+        self._set_keyphrase_cache_state(
+            text_hashes,
+            config_signature,
+            reset_incremental_counters=False,
+        )
+        return self
+
+    def fit(self, objects: List[Any]):
+        if self.object_to_text is None:
+            object_texts = list(objects)
+        else:
+            object_texts = [self.object_to_text(obj) for obj in objects]
+
+        text_hashes = self._text_hashes(object_texts)
+        config_signature = self._cache_config_signature()
+
+        if self.cache_policy == "auto" and self._has_compatible_cache(
+            config_signature
+        ):
+            cached_hashes = self._keyphrase_cache_text_hashes
+            if text_hashes == cached_hashes:
+                return self
+            if (
+                len(text_hashes) > len(cached_hashes)
+                and text_hashes[: len(cached_hashes)] == cached_hashes
+            ):
+                appended_texts = object_texts[len(cached_hashes) :]
+                ngrammer = self._build_ngrammer()
+                if self._append_is_cacheable(appended_texts, ngrammer):
+                    return self._fit_incremental(
+                        appended_texts,
+                        text_hashes,
+                        config_signature,
+                        ngrammer,
+                    )
+
+        self._fit_full(object_texts)
+        self._set_keyphrase_cache_state(
+            text_hashes,
+            config_signature,
+            reset_incremental_counters=True,
+        )
         return self
 
     def fit_transform(

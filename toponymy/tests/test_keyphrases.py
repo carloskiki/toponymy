@@ -1,4 +1,6 @@
+import toponymy.keyphrases as keyphrase_module
 from toponymy.keyphrases import (
+    KeyphraseBuilder,
     create_tokenizers_ngrammer,
     build_object_x_keyphrase_matrix,
     build_keyphrase_vocabulary,
@@ -12,6 +14,7 @@ from toponymy.keyphrases import (
 from toponymy.clustering import (
     centroids_from_labels,
 )
+from toponymy.toponymy import Toponymy
 
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
@@ -26,6 +29,51 @@ import pytest
 import json
 import bm25s
 import sentence_transformers
+
+
+class _CacheTestEmbedder:
+    def __init__(self):
+        self.encode_calls = 0
+
+    def encode(self, texts, show_progress_bar=False):
+        self.encode_calls += 1
+        return np.ones((len(texts), 2))
+
+
+class _CacheTestLLM:
+    supports_system_prompts = False
+
+
+class _CacheTestLayer:
+    object_to_text_function = None
+
+    def __init__(self, n_objects):
+        self.cluster_labels = np.zeros(n_objects, dtype=np.int32)
+        self.centroid_vectors = np.zeros((1, 2))
+        self.topic_names = []
+
+    def make_exemplar_texts(self, objects, embedding_vectors, method="central"):
+        self.exemplars = [list(objects[:1])]
+        return self.exemplars, [[0]]
+
+    def make_keyphrases(self, *args, **kwargs):
+        self.keyphrases = [["apple", "banana"]]
+
+    def make_prompts(self, *args, **kwargs):
+        self.prompts = ["Name this topic"]
+
+    def name_topics(self, *args, **kwargs):
+        self.topic_names = ["Cached Topic"]
+        return self.topic_names
+
+    def make_topic_name_vector(self):
+        return np.zeros(len(self.cluster_labels), dtype=np.int32)
+
+
+class _CacheTestClusterer:
+    def fit_predict(self, clusterable_vectors, *args, **kwargs):
+        layer = _CacheTestLayer(clusterable_vectors.shape[0])
+        return [layer], {}
 
 
 def create_ngrammer(ngram_range, token_pattern=r"(?u)\b\w\w+\b"):
@@ -71,6 +119,217 @@ def keyphrases(matrix_and_keyphrases):
 @pytest.fixture
 def keyphrase_vectors(keyphrases, embedder):
     return embedder.encode(keyphrases)
+
+
+def test_keyphrase_builder_default_cache_policy_rebuilds(monkeypatch):
+    calls = 0
+    original_build = keyphrase_module.build_object_x_keyphrase_matrix
+
+    def wrapped_build(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(
+        keyphrase_module, "build_object_x_keyphrase_matrix", wrapped_build
+    )
+    builder = KeyphraseBuilder(
+        ngram_range=(1, 1),
+        min_occurrences=1,
+        max_features=10,
+        n_jobs=1,
+    )
+
+    docs = ["apple banana", "banana cherry"]
+    builder.fit(docs)
+    builder.fit(docs)
+
+    assert calls == 2
+
+
+def test_keyphrase_builder_auto_cache_reuses_exact_fit(monkeypatch):
+    builder = KeyphraseBuilder(
+        ngram_range=(1, 1),
+        min_occurrences=1,
+        max_features=10,
+        n_jobs=1,
+        cache_policy="auto",
+    )
+    docs = ["apple banana", "banana cherry"]
+    builder.fit(docs)
+    cached_matrix = builder.object_x_keyphrase_matrix_
+
+    def fail_build(*args, **kwargs):
+        raise AssertionError("Exact cache hit should not rebuild keyphrases")
+
+    monkeypatch.setattr(
+        keyphrase_module, "build_object_x_keyphrase_matrix", fail_build
+    )
+    builder.fit(list(docs))
+
+    assert builder.object_x_keyphrase_matrix_ is cached_matrix
+
+
+def test_keyphrase_builder_auto_cache_extends_small_similar_append(monkeypatch):
+    builder = KeyphraseBuilder(
+        ngram_range=(1, 1),
+        min_occurrences=1,
+        max_features=10,
+        n_jobs=1,
+        cache_policy="auto",
+    )
+    base_docs = ["apple banana cherry"] * 20
+    appended_docs = ["apple banana cherry"]
+    builder.fit(base_docs)
+    cached_matrix = builder.object_x_keyphrase_matrix_.copy()
+    cached_keyphrases = list(builder.keyphrase_list_)
+
+    def fail_build(*args, **kwargs):
+        raise AssertionError("Similar append should extend the cached matrix")
+
+    monkeypatch.setattr(
+        keyphrase_module, "build_object_x_keyphrase_matrix", fail_build
+    )
+    builder.fit(base_docs + appended_docs)
+
+    assert builder.keyphrase_list_ == cached_keyphrases
+    assert builder.object_x_keyphrase_matrix_.shape[0] == len(base_docs) + 1
+    assert (
+        builder.object_x_keyphrase_matrix_[: len(base_docs)] != cached_matrix
+    ).nnz == 0
+    assert builder.object_x_keyphrase_matrix_[-1].nnz > 0
+
+
+def test_keyphrase_builder_auto_cache_rebuilds_for_novel_append():
+    builder = KeyphraseBuilder(
+        ngram_range=(1, 1),
+        min_occurrences=1,
+        max_features=10,
+        n_jobs=1,
+        cache_policy="auto",
+    )
+    base_docs = ["apple banana"] * 20
+    builder.fit(base_docs)
+
+    builder.fit(base_docs + ["kiwi mango papaya"])
+
+    assert "kiwi" in builder.keyphrase_list_
+    assert builder.object_x_keyphrase_matrix_.shape[0] == len(base_docs) + 1
+
+
+def test_keyphrase_builder_auto_cache_rebuilds_for_large_append(monkeypatch):
+    builder = KeyphraseBuilder(
+        ngram_range=(1, 1),
+        min_occurrences=1,
+        max_features=10,
+        n_jobs=1,
+        cache_policy="auto",
+    )
+    base_docs = ["apple banana cherry"] * 20
+    builder.fit(base_docs)
+
+    calls = 0
+    original_build = keyphrase_module.build_object_x_keyphrase_matrix
+
+    def wrapped_build(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(
+        keyphrase_module, "build_object_x_keyphrase_matrix", wrapped_build
+    )
+    builder.fit(base_docs + ["apple banana cherry"] * 5)
+
+    assert calls == 1
+
+
+def test_keyphrase_builder_auto_cache_rebuilds_when_config_changes(monkeypatch):
+    builder = KeyphraseBuilder(
+        ngram_range=(1, 1),
+        min_occurrences=1,
+        max_features=10,
+        n_jobs=1,
+        cache_policy="auto",
+    )
+    docs = ["apple banana", "banana cherry"]
+    builder.fit(docs)
+    builder.ngram_range = (1, 2)
+
+    calls = 0
+    original_build = keyphrase_module.build_object_x_keyphrase_matrix
+
+    def wrapped_build(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(
+        keyphrase_module, "build_object_x_keyphrase_matrix", wrapped_build
+    )
+    builder.fit(docs)
+
+    assert calls == 1
+
+
+def test_toponymy_uses_reused_keyphrase_builder_cache(monkeypatch):
+    builder = KeyphraseBuilder(
+        ngram_range=(1, 1),
+        min_occurrences=1,
+        max_features=10,
+        n_jobs=1,
+        cache_policy="auto",
+    )
+    base_docs = ["apple banana cherry"] * 20
+    embedding_vectors = np.ones((len(base_docs), 2))
+    clusterable_vectors = np.ones((len(base_docs), 2))
+    embedder = _CacheTestEmbedder()
+
+    Toponymy(
+        _CacheTestLLM(),
+        embedder,
+        _CacheTestClusterer(),
+        keyphrase_builder=builder,
+        verbose=False,
+    ).fit(base_docs, embedding_vectors, clusterable_vectors)
+    assert embedder.encode_calls == 1
+
+    def fail_build(*args, **kwargs):
+        raise AssertionError("Toponymy should reuse the builder cache")
+
+    monkeypatch.setattr(
+        keyphrase_module, "build_object_x_keyphrase_matrix", fail_build
+    )
+    appended_docs = base_docs + ["apple banana cherry"]
+    Toponymy(
+        _CacheTestLLM(),
+        embedder,
+        _CacheTestClusterer(),
+        keyphrase_builder=builder,
+        verbose=False,
+    ).fit(
+        appended_docs,
+        np.ones((len(appended_docs), 2)),
+        np.ones((len(appended_docs), 2)),
+    )
+
+    assert builder.object_x_keyphrase_matrix_.shape[0] == len(appended_docs)
+    assert embedder.encode_calls == 1
+
+    new_embedder = _CacheTestEmbedder()
+    Toponymy(
+        _CacheTestLLM(),
+        new_embedder,
+        _CacheTestClusterer(),
+        keyphrase_builder=builder,
+        verbose=False,
+    ).fit(
+        appended_docs,
+        np.ones((len(appended_docs), 2)),
+        np.ones((len(appended_docs), 2)),
+    )
+
+    assert new_embedder.encode_calls == 1
 
 
 @pytest.mark.parametrize("max_features", [900, 300])

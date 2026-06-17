@@ -295,11 +295,30 @@ class Toponymy:
                 method=exemplar_method,
             )
 
+        keyphrase_vector_source = getattr(
+            self.keyphrase_builder, "_keyphrase_vectors_generated_by", None
+        )
+        current_keyphrase_vector_source = (
+            "toponymy",
+            type(self.embedding_model),
+            id(self.embedding_model),
+        )
+        if (
+            keyphrase_vector_source is not None
+            and keyphrase_vector_source[0] == "toponymy"
+            and keyphrase_vector_source != current_keyphrase_vector_source
+        ):
+            self.keyphrase_vectors_ = None
+
         if self.keyphrase_vectors_ is None:
             # If the keyphrase vectors are None, we need to generate them
             self.keyphrase_vectors_ = self.embedding_model.encode(
                 self.keyphrase_list_,
                 show_progress_bar=self.show_progress_bars,
+            )
+            self.keyphrase_builder.keyphrase_vectors_ = self.keyphrase_vectors_
+            self.keyphrase_builder._keyphrase_vectors_generated_by = (
+                current_keyphrase_vector_source
             )
 
         # Iterate through the layers and build the topic names
