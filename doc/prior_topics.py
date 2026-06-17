@@ -116,9 +116,19 @@ llm = AzureAINamer(
 )
 
 # %% [markdown]
-# We'll use the same model configuration for both runs. The factory below creates a
-# fresh `ToponymyClusterer` for each fit so that the second run builds cluster layers
-# for the full, updated dataset.
+# We'll use the same keyphrase builder for both runs so that the second fit can
+# reuse the cached keyphrase vocabulary and vectors from the first fit. The factory
+# below still creates a fresh `ToponymyClusterer` for each fit so that the second
+# run builds cluster layers for the full, updated dataset.
+
+# %%
+keyphrase_builder = KeyphraseBuilder(
+    ngram_range=(1, 6),
+    max_features=15_000,
+    verbose=True,
+    cache_policy="auto",
+)
+
 
 # %%
 def make_topic_model(previous_cluster_layers=None):
@@ -126,11 +136,7 @@ def make_topic_model(previous_cluster_layers=None):
         llm_wrapper=llm,
         text_embedding_model=embedding_model,
         clusterer=ToponymyClusterer(min_clusters=4, verbose=True),
-        keyphrase_builder=KeyphraseBuilder(
-            ngram_range=(1, 6),
-            max_features=15_000,
-            verbose=True,
-        ),
+        keyphrase_builder=keyphrase_builder,
         object_description="newsgroup posts",
         corpus_description="20-newsgroups dataset",
         exemplar_delimiters=["<EXAMPLE_POST>\n", "\n</EXAMPLE_POST>\n\n"],
